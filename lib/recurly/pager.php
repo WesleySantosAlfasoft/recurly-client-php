@@ -1,155 +1,153 @@
 <?php
 
-namespace Recurly;
-
-class Pager implements \Iterator
+/**
+ * Paginate through multiple pages of a resource. Used for lists that
+ * may require multiple API calls to retrieve all the results.
+ *
+ * The pager moves forward only and can rewind to the first item.
+ */
+abstract class Recurly_Pager extends Recurly_Base implements Iterator, Countable
 {
-    private $_client;
-    private $_path;
-    private $_params;
-    private $_current_page;
+  private $_position = 0;    // position within the current page
+  protected $_objects;       // current page of records
 
-    /**
-     * Constructor
-     * 
-     * @param \Recurly\BaseClient $client A \Recurly\BaseClient that can make API
-     *                                    requests 
-     * @param string              $path   Tokenized path to request
-     * @param array               $params (optional) Query string parameters
-     */
-    public function __construct(\Recurly\BaseClient $client, string $path, ?array $params = [])
-    {
-        $this->_client = $client;
-        $this->_path = $path;
-        $this->_params = $this->_mapArrayParams($params);
+  /**
+   * If the pager has a URL this will send a HEAD request to get the count of
+   * all records. Otherwise it'll return the count of the cached _objects.
+   *
+   * @return integer number of records in list
+   * @throws Recurly_Error
+   */
+  public function count() {
+    if (isset($this->_href)) {
+      $headers = Recurly_Base::_head($this->_href, $this->_client);
+      if (isset($headers['x-records'])) {
+        return intval($headers['x-records']);
+      }
+    } elseif (isset($this->_objects) && is_array($this->_objects)) {
+      return count($this->_objects);
     }
 
-    /**
-     * Maps parameters with array values into csv strings. The API expects these
-     * values to be csv strings, but an array is a nicer interface for developers.
-     * 
-     * @param array $params Associative array of parameters
-     * 
-     * @return array
-     */
-    private function _mapArrayParams(?array $params = []): ?array
-    {
-        if (!is_null($params)) {
-            array_walk(
-                $params, function (&$param, $key) {
-                    if (is_array($param)) {
-                        $param = join(',', $param);
-                    }
-                }
-            );
-        }
-        return $params;
+    return null;
+  }
+
+  /**
+   * Rewind to the beginning
+   *
+   * @throws Recurly_Error
+   */
+  public function rewind() {
+    $this->_loadFrom($this->_href);
+    $this->_position = 0;
+  }
+
+  /**
+   * The current object
+   *
+   * @return Recurly_Resource the current object
+   * @throws Recurly_Error
+   */
+  public function current()
+  {
+    // Work around pre-PHP 5.5 issue that prevents `empty($this->count())`:
+    if (!isset($this->_objects)) {
+      $this->_loadFrom($this->_href);
     }
 
-    /**
-     * Makes a HEAD request to the API to determine how many total records exist.
-     * 
-     * @return string
-     */
-    public function getCount()
-    {
-        $response = $this->_client->pagerCount($this->_path, $this->_params);
-        return $response->getRecordCount();
-    }
-
-    /**
-     * Performs a request with the pager `limit` set to 1.
-     * 
-     * @return ?\Recurly\RecurlyResource 
-     */
-    public function getFirst(): ?\Recurly\RecurlyResource
-    {
-        $params = array_merge([ 'limit' => 1 ], $this->_params);
-        $page = $this->_client->nextPage($this->_path, $params);
-        if ($page->valid()) {
-            return $page->current();
-        }
+    if ($this->_position >= sizeof($this->_objects)) {
+      if (isset($this->_links['next'])) {
+        $this->_loadFrom($this->_links['next']);
+        $this->_position = 0;
+      }
+      else if (empty($this->_objects) && ($this->_position == 0)) {
         return null;
+      }
+      else {
+        throw new Recurly_Error("Pager is not in a valid state");
+      }
     }
 
-    /**
-     * Getter for the Recurly HTTP Response of the current Page
-     * 
-     * @return \Recurly\Response The Recurly HTTP Response
-     */
-    public function getResponse(): \Recurly\Response
-    {
-        return $this->_current_page->getResponse();
+    return $this->_objects[$this->_position];
+  }
+
+  /**
+   * @return integer current position within the current page
+   */
+  public function key() {
+    return $this->_position;
+  }
+
+  /**
+   * Increments the position to the next element
+   */
+  public function next() {
+    ++$this->_position;
+  }
+
+  /**
+   * @return boolean True if the current position is valid.
+   */
+  public function valid() {
+    return (isset($this->_objects[$this->_position]) || isset($this->_links['next']));
+  }
+
+  /**
+   * Load another page of results into this pager.
+   *
+   * @param $uri
+   * @throws Recurly_Error
+   */
+  protected function _loadFrom($uri) {
+    if (empty($uri)) {
+      return;
     }
 
-    /**
-     * Implementation of the Iterator interfaces `rewind` method.
-     * Resets the Iterator to the first page of results.
-     * 
-     * @return void
-     */
-    public function rewind(): void
-    {
-        $this->_current_page = $this->_client->nextPage(
-            $this->_path,
-            $this->_params
-        );
-    }
+    $response = $this->_client->request(Recurly_Client::GET, $uri);
+    $response->assertValidResponse();
 
-    /**
-     * Implementation of the Iterator interfaces `current` method.
-     * 
-     * @return \Recurly\RecurlyResource
-     */
-    public function current(): \Recurly\RecurlyResource
-    {
-        return $this->_current_page->current();
-    }
+    $this->_objects = array();
+    $this->__parseXmlToUpdateObject($response->body);
+    $this->_afterParseResponse($response, $uri);
+  }
 
-    /**
-     * Implementation of the Iterator interfaces `key` method.
-     * Will return NULL for every iteration.
-     * 
-     * @return             void
-     * @codeCoverageIgnore
-     */
-    public function key(): void
-    {
-        //NOOP
-    }
+  protected function _afterParseResponse($response, $uri) {
+    $this->_loadLinks($response);
+    $this->_href = isset($this->_links['start']) ? $this->_links['start'] : $uri;
+  }
 
-    /**
-     * Implementation of the Iterator interfaces `next` method.
-     * 
-     * @return             void
-     * @codeCoverageIgnore
-     */
-    public function next(): void
-    {
-        //NOOP
+  protected static function _setState($params, $state) {
+    if (is_null($params)) {
+      $params = array();
     }
+    $params['state'] = $state;
+    return $params;
+  }
 
-    /**
-     * Implementation of the Iterator interfaces `valid` method.
-     * 
-     * @return bool
-     */
-    public function valid(): bool
-    {
-        if (!$this->_current_page->valid() && $this->_current_page->getHasMore()) {
-            $this->_loadNextPage();
+  /**
+   * The 'Links' header contains links to the next, previous, and starting pages.
+   * This parses the links header into an array of links if the header is present.
+   *
+   * @param $response
+   */
+  private function _loadLinks($response) {
+    $this->_links = array();
+
+    if (isset($response->headers['link'])) {
+      $links = $response->headers['link'];
+      preg_match_all('/\<([^>]+)\>; rel=\"([^"]+)\"/', $links, $matches);
+      if (sizeof($matches) > 2) {
+        for ($i = 0; $i < sizeof($matches[1]); $i++) {
+          $this->_links[$matches[2][$i]] = $matches[1][$i];
         }
-        return $this->_current_page->valid();
+      }
     }
+  }
 
-    /**
-     * Fetches the next page from the API server.
-     * 
-     * @return void
-     */
-    private function _loadNextPage(): void
-    {
-        $next_page = $this->_current_page->getNext();
-        $this->_current_page = $this->_client->nextPage($next_page, null);
-    }
+  protected function updateErrorAttributes() {}
+
+  public function __toString()
+  {
+    $class = get_class($this);
+    return "<{$class}[href={$this->getHref()}]>";
+  }
 }

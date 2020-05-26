@@ -1,174 +1,138 @@
 <?php
 
-namespace Recurly;
-
-class Response
+class Recurly_ClientResponse
 {
-    private $_response;
-    private $_status_code;
-    private $_headers = [];
-    private const BINARY_TYPES = [
-        'application/pdf'
-    ];
+  var $statusCode;
+  var $headers;
+  var $body;
 
-    /**
-     * Constructor
-     * 
-     * @param string $response The raw HTTP response string
-     */
-    public function __construct(string $response)
-    {
-        $this->_response = $response;
-    }
+  function __construct($statusCode, $headers, $body) {
+    $this->statusCode = $statusCode;
+    $this->headers = $headers;
+    $this->body = $body;
+  }
 
-    /**
-     * The raw string response from the API server.
-     * 
-     * @return string
-     */
-    public function getRawResponse(): string
+  /**
+   * @param $object
+   * @throws Recurly_ValidationError
+   */
+  public function assertSuccessResponse($object)
+  {
+    if ($this->statusCode == 422)
     {
-        return $this->_response;
-    }
-
-    /**
-     * Decodes and returns the raw response as JSON
-     * 
-     * @return object Parsed JSON body
-     */
-    public function getJsonResponse(): ?object
-    {
-        return json_decode($this->_response);
-    }
-
-    /**
-     * Converts the Response into a \Recurly\RecurlyResource
-     * 
-     * @return \Recurly\RecurlyResource
-     */
-    public function toResource(): \Recurly\RecurlyResource
-    {
-        if ($this->_status_code >= 200 && $this->_status_code < 300) {
-            if (empty($this->_response)) {
-                return \Recurly\RecurlyResource::fromEmpty($this);
-            } elseif (in_array($this->getContentType(), static::BINARY_TYPES)) {
-                return \Recurly\RecurlyResource::fromBinary($this->_response, $this);
-            } else {
-                return \Recurly\RecurlyResource::fromResponse($this);
-            }
-        } else {
-            throw \Recurly\RecurlyError::fromResponse($this);
+      if ($object instanceof Recurly_FieldError)
+        throw new Recurly_ValidationError('Validation error', null, array($object));
+      else if ($object instanceof Recurly_ErrorList)
+        throw new Recurly_ValidationError('Validation error', null, $object);
+      else if (is_array($object) && count($object) == 3) {
+        $trans_error = $object[0];
+        $transaction = $object[2];
+        if ($trans_error instanceof Recurly_TransactionError && $transaction instanceof Recurly_Transaction)
+          throw new Recurly_ValidationError($trans_error->customer_message, $transaction, array($trans_error));
+      }
+      else {
+        // Here we are making sure that this isn't a ValidationError in the shape of a FieldError
+        // If it is, we will reshape it into a ValidationError
+        $error = @$this->parseErrorXml($this->body);
+        if (isset($error)) {
+          throw new Recurly_ValidationError('Validation error', $object, array($error));
         }
+        throw new Recurly_ValidationError('Validation error', $object, $object->getErrors());
+      }
+
+    }
+  }
+
+  /**
+   * @throws Recurly_Error
+   */
+  public function assertValidResponse()
+  {
+    if (!empty($this->headers['recurly-deprecated'])) {
+      error_log("WARNING: API version {$this->headers['x-api-version']} is deprecated and will only be available until {$this->headers['recurly-sunset-date']}. Please upgrade the Recurly PHP client.");
     }
 
-    /**
-     * Parses the HTTP response headers. If the $headers param is null
-     * then a 400 Bad Request is assumed.
-     * 
-     * @param array $headers An array of HTTP response headers
-     * 
-     * @return void
-     */
-    public function setHeaders(?array $headers): void
-    {
-        if (empty($headers)) {
-            $headers = array('HTTP/1.1 400 Bad request');
-        }
+    // Successful response code
+    if ($this->statusCode >= 200 && $this->statusCode < 400)
+      return;
 
-        foreach ($headers as $header) {
-            if (preg_match("#HTTP/[0-9\.]+\s+([0-9]+)#", $header, $out)) {
-                $this->_status_code = intval($out[1]);
-            } else {
-                $parts = explode(':', $header, 2);
-                if (count($parts) == 2) {
-                    $this->_headers[$parts[0]] = trim($parts[1]);
-                }
-            }
-        }
+    // Do not fail here if the response is not valid XML
+    $error = @$this->parseErrorXml($this->body);
+    $recurlyCode = (is_null($error) ? null : $error->symbol);
+
+    switch ($this->statusCode) {
+      case 0:
+        throw new Recurly_ConnectionError('An error occurred while connecting to Recurly.');
+      case 400:
+        $message = (is_null($error) ? 'Bad API Request' : (string) $error);
+        throw new Recurly_Error($message, 0, null, $recurlyCode);
+      case 401:
+        throw new Recurly_UnauthorizedError('Your API Key is not authorized to connect to Recurly.');
+      case 403:
+        throw new Recurly_UnauthorizedError('Please use an API key to connect to Recurly.');
+      case 404:
+        $message = (is_null($error) ? 'Object not found' : $error->description);
+        throw new Recurly_NotFoundError($message, 0, null, $recurlyCode);
+      case 422:
+        // Handled in assertSuccessResponse()
+        return;
+      case 429:
+        throw new Recurly_ApiRateLimitError('You have made too many API requests in the last 5 minutes. Future API requests may be ignored until your rate limit resets in 5 minutes. Please visit: https://dev.recurly.com/docs/rate-limits');
+      case 500:
+        $message = (is_null($error) ? 'An error occurred while connecting to Recurly' :
+                   'An error occurred while connecting to Recurly: ' . $error->description);
+        throw new Recurly_ServerError($message);
+      case 502:
+      case 503:
+      case 504:
+        throw new Recurly_ConnectionError('An error occurred while connecting to Recurly.');
     }
 
-    /**
-     * Getter method for the HTTP status code
-     * 
-     * @return int The HTTP status code
-     */
-    public function getStatusCode(): int
-    {
-        return $this->_status_code;
-    }
+    // Catch future 400-499 errors as request errors
+    if ($this->statusCode >= 400 && $this->statusCode < 500)
+      throw new Recurly_RequestError("Invalid request, status code: {$this->statusCode}");
 
-    /**
-     * Getter method for the X-Request-Id HTTP response header
-     * 
-     * @return string The X-Request-Id header value
-     */
-    public function getRequestId(): string
-    {
-        return $this->_getHeaderValue('X-Request-Id');
+    // Catch future 500-599 errors as server errors
+    if ($this->statusCode >= 500 && $this->statusCode < 600) {
+      $message = (is_null($error) ? 'An error occurred while connecting to Recurly' :
+                 'An error occurred while connecting to Recurly: ' . $error->description);
+      throw new Recurly_ServerError($message);
     }
+  }
 
-    /**
-     * Getter method for the X-RateLimit-Limit HTTP response header
-     * 
-     * @return string The X-RateLimit-Limit header value
-     */
-    public function getRateLimit(): string
-    {
-        return $this->_getHeaderValue('X-RateLimit-Limit');
-    }
+  private function parseErrorXml($xml) {
+    $dom = new DOMDocument();
 
-    /**
-     * Getter method for the X-RateLimit-Remaining HTTP response header
-     * 
-     * @return string The X-RateLimit-Remaining header value
-     */
-    public function getRateLimitRemaining(): string
-    {
-        return $this->_getHeaderValue('X-RateLimit-Remaining');
-    }
+    Recurly_Client::disableXmlEntityLoading();
 
-    /**
-     * Getter method for the X-RateLimit-Reset HTTP response header
-     * 
-     * @return string The X-RateLimit-Reset header value
-     */
-    public function getRateLimitReset(): string
-    {
-        return $this->_getHeaderValue('X-RateLimit-Reset');
-    }
+    if (empty($xml) || !$dom->loadXML($xml)) return null;
 
-    /**
-     * Getter method for the Content-Type HTTP response header
-     * 
-     * @return string The Content-Type header value
-     */
-    public function getContentType(): string
-    {
-        $raw = $this->_getHeaderValue('Content-Type');
-        $parts = explode('; ', $raw);
-        return $parts[0];
-    }
+    $rootNode = $dom->documentElement;
+    if ($rootNode->nodeName == 'error')
+      return Recurly_ClientResponse::parseErrorNode($rootNode);
+    else
+      return null;
+  }
 
-    /**
-     * Getter method for the Recurly-Total-Records HTTP response header
-     * 
-     * @return string The Recurly-Total-Records header value
-     */
-    public function getRecordCount(): string
-    {
-        return $this->_getHeaderValue('Recurly-Total-Records');
-    }
+  private static function parseErrorNode($node)
+  {
+    $node = $node->firstChild;
+    $error = new Recurly_FieldError();
 
-    /**
-     * Generic getter method for the HTTP response headers
-     * 
-     * @param string $key     The header name to lookup
-     * @param string $default (optional) The value to return if the header is not set
-     * 
-     * @return string The header value or an empty string if the header is not set
-     */
-    private function _getHeaderValue(string $key, $default = '')
-    {
-        return key_exists($key, $this->_headers) ? $this->_headers[$key] : $default;
+    while ($node) {
+      switch ($node->nodeName) {
+        case 'symbol':
+          $error->symbol = $node->nodeValue;
+          break;
+        case 'description':
+          $error->description = $node->nodeValue;
+          break;
+        case 'details':
+          $error->details = $node->nodeValue;
+          break;
+      }
+      $node = $node->nextSibling;
     }
+    return $error;
+  }
 }
